@@ -28,10 +28,15 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
 
 #include <libusb.h>
 
 #include <libimobiledevice-glue/collection.h>
+#include <libimobiledevice-glue/thread.h>
 
 #include "usb.h"
 #include "log.h"
@@ -81,6 +86,257 @@ static int devlist_failures;
 static int device_polling;
 static int device_hotplug = 1;
 
+/*
+ * Some libusb backends (Windows) cannot expose their event sources as file
+ * descriptors, so libusb_get_pollfds() fails there. In that case libusb events
+ * are handled on a dedicated thread. Its transfer callbacks only queue the
+ * completed transfer and wake the main loop through a pipe; the original
+ * callbacks then run on the main loop, so the rest of usbmuxd stays
+ * single-threaded.
+ */
+struct deferred_xfer {
+	struct libusb_transfer *xfer;
+	libusb_transfer_cb_fn callback;
+	uint8_t flags;
+	struct deferred_xfer *next;
+};
+
+static int event_thread_mode;
+static THREAD_T event_thread = THREAD_T_NULL;
+static volatile int event_thread_exit;
+static int event_wakeup_pipe[2] = { -1, -1 };
+static mutex_t deferred_mutex;
+static struct deferred_xfer *pending_xfers;
+static struct deferred_xfer *completed_head;
+static struct deferred_xfer *completed_tail;
+
+static void LIBUSB_CALL deferred_callback(struct libusb_transfer *xfer)
+{
+	struct deferred_xfer **pp;
+	struct deferred_xfer *p = NULL;
+
+	mutex_lock(&deferred_mutex);
+	for (pp = &pending_xfers; *pp; pp = &(*pp)->next) {
+		if ((*pp)->xfer == xfer) {
+			p = *pp;
+			*pp = p->next;
+			break;
+		}
+	}
+	if (p) {
+		p->next = NULL;
+		if (completed_tail)
+			completed_tail->next = p;
+		else
+			completed_head = p;
+		completed_tail = p;
+	}
+	mutex_unlock(&deferred_mutex);
+
+	if (!p) {
+		usbmuxd_log(LL_ERROR, "Completed transfer %p is not tracked", xfer);
+		return;
+	}
+	if (write(event_wakeup_pipe[1], "x", 1) < 0 && errno != EAGAIN) {
+		usbmuxd_log(LL_ERROR, "Failed to wake up main loop: %s", strerror(errno));
+	}
+}
+
+static int usb_submit_transfer(struct libusb_transfer *xfer)
+{
+	struct deferred_xfer *p;
+	int res;
+
+	if (!event_thread_mode)
+		return libusb_submit_transfer(xfer);
+
+	p = malloc(sizeof(struct deferred_xfer));
+	if (!p)
+		return LIBUSB_ERROR_NO_MEM;
+	p->xfer = xfer;
+	p->callback = xfer->callback;
+	p->flags = xfer->flags;
+	// libusb would free the transfer as soon as deferred_callback returns
+	xfer->flags &= ~LIBUSB_TRANSFER_FREE_TRANSFER;
+	xfer->callback = deferred_callback;
+
+	mutex_lock(&deferred_mutex);
+	p->next = pending_xfers;
+	pending_xfers = p;
+	mutex_unlock(&deferred_mutex);
+
+	res = libusb_submit_transfer(xfer);
+	if (res < 0) {
+		struct deferred_xfer **pp;
+		mutex_lock(&deferred_mutex);
+		for (pp = &pending_xfers; *pp; pp = &(*pp)->next) {
+			if (*pp == p) {
+				*pp = p->next;
+				break;
+			}
+		}
+		mutex_unlock(&deferred_mutex);
+		xfer->callback = p->callback;
+		xfer->flags = p->flags;
+		free(p);
+	}
+	return res;
+}
+
+static void dispatch_completed_transfers(libusb_device_handle *cancel_handle)
+{
+	char buf[64];
+
+	while (read(event_wakeup_pipe[0], buf, sizeof(buf)) > 0);
+
+	while (1) {
+		struct deferred_xfer *p;
+		struct libusb_transfer *xfer;
+		libusb_transfer_cb_fn callback;
+		int free_transfer;
+
+		mutex_lock(&deferred_mutex);
+		p = completed_head;
+		if (p) {
+			completed_head = p->next;
+			if (!completed_head)
+				completed_tail = NULL;
+		}
+		mutex_unlock(&deferred_mutex);
+		if (!p)
+			break;
+
+		xfer = p->xfer;
+		callback = p->callback;
+		free_transfer = p->flags & LIBUSB_TRANSFER_FREE_TRANSFER;
+		xfer->callback = callback;
+		xfer->flags = p->flags;
+		free(p);
+
+		// the device is being disconnected: make the callback clean up instead of resubmitting
+		if (cancel_handle && xfer->dev_handle == cancel_handle)
+			xfer->status = LIBUSB_TRANSFER_CANCELLED;
+
+		callback(xfer);
+		if (free_transfer)
+			libusb_free_transfer(xfer);
+	}
+}
+
+static int wait_completed_transfers(int msec)
+{
+	struct pollfd pfd;
+	pfd.fd = event_wakeup_pipe[0];
+	pfd.events = POLLIN;
+	pfd.revents = 0;
+	if (poll(&pfd, 1, msec) < 0 && errno != EINTR)
+		return -1;
+	dispatch_completed_transfers(NULL);
+	return 0;
+}
+
+static void drain_device_transfers(libusb_device_handle *handle)
+{
+	while (1) {
+		struct libusb_transfer *to_cancel[16];
+		struct deferred_xfer *p;
+		int ncancel = 0;
+		int pending = 0;
+		int i;
+
+		mutex_lock(&deferred_mutex);
+		for (p = pending_xfers; p; p = p->next) {
+			if (p->xfer->dev_handle == handle) {
+				if (ncancel < (int)(sizeof(to_cancel) / sizeof(to_cancel[0])))
+					to_cancel[ncancel++] = p->xfer;
+				pending++;
+			}
+		}
+		mutex_unlock(&deferred_mutex);
+
+		// transfers are only freed on this thread, so they stay valid outside the lock
+		for (i = 0; i < ncancel; i++)
+			libusb_cancel_transfer(to_cancel[i]);
+
+		dispatch_completed_transfers(handle);
+		if (!pending)
+			break;
+
+		struct pollfd pfd;
+		pfd.fd = event_wakeup_pipe[0];
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+		if (poll(&pfd, 1, 1) < 0 && errno != EINTR) {
+			usbmuxd_log(LL_ERROR, "Waiting for transfers in usb_disconnect failed: %s", strerror(errno));
+			break;
+		}
+	}
+}
+
+static void *event_thread_func(void *data)
+{
+	while (!event_thread_exit) {
+		struct timeval tv = { 1, 0 };
+		int res = libusb_handle_events_timeout_completed(NULL, &tv, (int*)&event_thread_exit);
+		if (res < 0 && res != LIBUSB_ERROR_INTERRUPTED) {
+			usbmuxd_log(LL_ERROR, "libusb_handle_events_timeout_completed failed: %s", libusb_error_name(res));
+		}
+	}
+	return NULL;
+}
+
+static int event_thread_start(void)
+{
+	int i;
+	if (pipe(event_wakeup_pipe) < 0) {
+		usbmuxd_log(LL_FATAL, "Failed to create wakeup pipe: %s", strerror(errno));
+		return -1;
+	}
+	for (i = 0; i < 2; i++) {
+		fcntl(event_wakeup_pipe[i], F_SETFL, fcntl(event_wakeup_pipe[i], F_GETFL) | O_NONBLOCK);
+		fcntl(event_wakeup_pipe[i], F_SETFD, FD_CLOEXEC);
+	}
+	mutex_init(&deferred_mutex);
+	event_thread_exit = 0;
+	event_thread_mode = 1;
+	if (thread_new(&event_thread, event_thread_func, NULL) != 0) {
+		usbmuxd_log(LL_FATAL, "Failed to start libusb event thread");
+		event_thread_mode = 0;
+		return -1;
+	}
+	return 0;
+}
+
+static void event_thread_stop(void)
+{
+	if (!event_thread_mode)
+		return;
+	event_thread_exit = 1;
+#if LIBUSB_API_VERSION >= 0x01000105
+	libusb_interrupt_event_handler(NULL);
+#endif
+	thread_join(event_thread);
+	thread_free(event_thread);
+	event_thread = THREAD_T_NULL;
+	// like without the event thread, callbacks of transfers left at shutdown are not run
+	while (completed_head) {
+		struct deferred_xfer *p = completed_head;
+		completed_head = p->next;
+		free(p);
+	}
+	completed_tail = NULL;
+	while (pending_xfers) {
+		struct deferred_xfer *p = pending_xfers;
+		pending_xfers = p->next;
+		free(p);
+	}
+	close(event_wakeup_pipe[0]);
+	close(event_wakeup_pipe[1]);
+	event_wakeup_pipe[0] = event_wakeup_pipe[1] = -1;
+	mutex_destroy(&deferred_mutex);
+	event_thread_mode = 0;
+}
+
 static void usb_disconnect(struct usb_device *dev)
 {
 	if(!dev->handle) {
@@ -100,9 +356,17 @@ static void usb_disconnect(struct usb_device *dev)
 	} ENDFOREACH
 
 	// Busy-wait until all xfers are closed
+	if(event_thread_mode) {
+		drain_device_transfers(dev->handle);
+	}
 	while(collection_count(&dev->rx_xfers) || collection_count(&dev->tx_xfers)) {
 		struct timeval tv;
 		int res;
+
+		if(event_thread_mode) {
+			usbmuxd_log(LL_ERROR, "usb_disconnect: transfers still queued after draining");
+			break;
+		}
 
 		tv.tv_sec = 0;
 		tv.tv_usec = 1000;
@@ -178,7 +442,7 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 	int res;
 	struct libusb_transfer *xfer = libusb_alloc_transfer(0);
 	libusb_fill_bulk_transfer(xfer, dev->handle, dev->ep_out, (void*)buf, length, tx_callback, dev, 0);
-	if((res = libusb_submit_transfer(xfer)) < 0) {
+	if((res = usb_submit_transfer(xfer)) < 0) {
 		usbmuxd_log(LL_ERROR, "Failed to submit TX transfer %p len %d to device %d-%d: %s", buf, length, dev->bus, dev->address, libusb_error_name(res));
 		libusb_free_transfer(xfer);
 		return res;
@@ -190,7 +454,7 @@ int usb_send(struct usb_device *dev, const unsigned char *buf, int length)
 		xfer = libusb_alloc_transfer(0);
 		void *buffer = malloc(1);
 		libusb_fill_bulk_transfer(xfer, dev->handle, dev->ep_out, buffer, 0, tx_callback, dev, 0);
-		if((res = libusb_submit_transfer(xfer)) < 0) {
+		if((res = usb_submit_transfer(xfer)) < 0) {
 			usbmuxd_log(LL_ERROR, "Failed to submit TX ZLP transfer to device %d-%d: %s", dev->bus, dev->address, libusb_error_name(res));
 			libusb_free_transfer(xfer);
 			return res;
@@ -209,7 +473,7 @@ static void rx_callback(struct libusb_transfer *xfer)
 	usbmuxd_log(LL_SPEW, "RX callback dev %d-%d len %d status %d", dev->bus, dev->address, xfer->actual_length, xfer->status);
 	if(xfer->status == LIBUSB_TRANSFER_COMPLETED) {
 		device_data_input(dev, xfer->buffer, xfer->actual_length);
-		libusb_submit_transfer(xfer);
+		usb_submit_transfer(xfer);
 	} else {
 		switch(xfer->status) {
 			case LIBUSB_TRANSFER_COMPLETED: //shut up compiler
@@ -257,7 +521,7 @@ static int start_rx_loop(struct usb_device *dev)
 	struct libusb_transfer *xfer = libusb_alloc_transfer(0);
 	buf = malloc(USB_MRU);
 	libusb_fill_bulk_transfer(xfer, dev->handle, dev->ep_in, buf, USB_MRU, rx_callback, dev, 0);
-	if((res = libusb_submit_transfer(xfer)) != 0) {
+	if((res = usb_submit_transfer(xfer)) != 0) {
 		usbmuxd_log(LL_ERROR, "Failed to submit RX transfer to device %d-%d: %s", dev->bus, dev->address, libusb_error_name(res));
 		libusb_free_transfer(xfer);
 		return res;
@@ -359,7 +623,7 @@ static void get_langid_callback(struct libusb_transfer *transfer)
 			langid, 1024 + LIBUSB_CONTROL_SETUP_SIZE);
 	libusb_fill_control_transfer(transfer, usbdev->handle, transfer->buffer, get_serial_callback, usbdev, 1000);
 
-	if((res = libusb_submit_transfer(transfer)) < 0) {
+	if((res = usb_submit_transfer(transfer)) < 0) {
 		usbmuxd_log(LL_ERROR, "Could not request transfer for device %d-%d: %s", usbdev->bus, usbdev->address, libusb_error_name(res));
 		libusb_free_transfer(transfer);
 	}
@@ -376,7 +640,7 @@ static int submit_vendor_specific(struct libusb_device_handle *handle, struct mo
 	ctrl_transfer->flags = LIBUSB_TRANSFER_FREE_TRANSFER;
 	libusb_fill_control_transfer(ctrl_transfer, handle, buffer, callback, context, context->timeout);
 	
-	ret = libusb_submit_transfer(ctrl_transfer);
+	ret = usb_submit_transfer(ctrl_transfer);
 	return ret;
 }
 
@@ -646,7 +910,7 @@ static void device_complete_initialization(struct mode_context *context, struct 
 	libusb_fill_control_setup(transfer_buffer, LIBUSB_ENDPOINT_IN, LIBUSB_REQUEST_GET_DESCRIPTOR, LIBUSB_DT_STRING << 8, 0, 1024 + LIBUSB_CONTROL_SETUP_SIZE);
 	libusb_fill_control_transfer(transfer, handle, transfer_buffer, get_langid_callback, usbdev, 1000);
 
-	if((res = libusb_submit_transfer(transfer)) < 0) {
+	if((res = usb_submit_transfer(transfer)) < 0) {
 		usbmuxd_log(LL_ERROR, "Could not request transfer for device %d-%d: %s", usbdev->bus, usbdev->address, libusb_error_name(res));
 		libusb_free_transfer(transfer);
 		free(transfer_buffer);
@@ -901,6 +1165,10 @@ void usb_get_fds(struct fdlist *list)
 {
 	const struct libusb_pollfd **usbfds;
 	const struct libusb_pollfd **p;
+	if(event_thread_mode) {
+		fdlist_add(list, FD_USB, event_wakeup_pipe[0], POLLIN);
+		return;
+	}
 	usbfds = libusb_get_pollfds(NULL);
 	if(!usbfds) {
 		usbmuxd_log(LL_ERROR, "libusb_get_pollfds failed");
@@ -942,6 +1210,8 @@ int usb_get_timeout(void)
 	int res;
 	int pollrem;
 	pollrem = dev_poll_remain_ms();
+	if(event_thread_mode)
+		return pollrem;
 	res = libusb_get_next_timeout(NULL, &tv);
 	if(res == 0)
 		return pollrem;
@@ -960,11 +1230,15 @@ int usb_process(void)
 {
 	int res;
 	struct timeval tv;
-	tv.tv_sec = tv.tv_usec = 0;
-	res = libusb_handle_events_timeout(NULL, &tv);
-	if(res < 0) {
-		usbmuxd_log(LL_ERROR, "libusb_handle_events_timeout failed: %s", libusb_error_name(res));
-		return res;
+	if(event_thread_mode) {
+		dispatch_completed_transfers(NULL);
+	} else {
+		tv.tv_sec = tv.tv_usec = 0;
+		res = libusb_handle_events_timeout(NULL, &tv);
+		if(res < 0) {
+			usbmuxd_log(LL_ERROR, "libusb_handle_events_timeout failed: %s", libusb_error_name(res));
+			return res;
+		}
 	}
 
 	// reap devices marked dead due to an RX error
@@ -996,10 +1270,14 @@ int usb_process_timeout(int msec)
 			tleft.tv_usec += 1000000;
 			tleft.tv_sec -= 1;
 		}
-		res = libusb_handle_events_timeout(NULL, &tleft);
-		if(res < 0) {
-			usbmuxd_log(LL_ERROR, "libusb_handle_events_timeout failed: %s", libusb_error_name(res));
-			return res;
+		if(event_thread_mode) {
+			wait_completed_transfers(tleft.tv_sec * 1000 + tleft.tv_usec / 1000);
+		} else {
+			res = libusb_handle_events_timeout(NULL, &tleft);
+			if(res < 0) {
+				usbmuxd_log(LL_ERROR, "libusb_handle_events_timeout failed: %s", libusb_error_name(res));
+				return res;
+			}
 		}
 		// reap devices marked dead due to an RX error
 		reap_dead_devices();
@@ -1049,6 +1327,18 @@ int usb_init(void)
 		return -1;
 	}
 
+	// probe before raising libusb's log level, which would log the expected failure
+	const struct libusb_pollfd **usbfds = libusb_get_pollfds(NULL);
+	if (usbfds) {
+		libusb_free_pollfds(usbfds);
+	} else {
+		usbmuxd_log(LL_INFO, "libusb cannot expose pollable file descriptors, handling libusb events on a separate thread");
+		if (event_thread_start() < 0) {
+			libusb_exit(NULL);
+			return -1;
+		}
+	}
+
 #if LIBUSB_API_VERSION >= 0x01000106
 	libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL, (log_level >= LL_DEBUG ? LIBUSB_LOG_LEVEL_DEBUG: (log_level >= LL_WARNING ? LIBUSB_LOG_LEVEL_WARNING: LIBUSB_LOG_LEVEL_NONE)));
 #else
@@ -1058,7 +1348,10 @@ int usb_init(void)
 	collection_init(&device_list);
 
 #ifdef HAVE_LIBUSB_HOTPLUG_API
-	if (libusb_has_capability(LIBUSB_CAP_HAS_HOTPLUG)) {
+	if (event_thread_mode) {
+		// hotplug callbacks would run on the event thread, so poll for devices instead
+		usbmuxd_log(LL_INFO, "Using device polling with the libusb event thread");
+	} else if (libusb_has_capability(LIBUSB_CAP_HAS_HOTPLUG)) {
 		usbmuxd_log(LL_INFO, "Registering for libusb hotplug events");
 		res = libusb_hotplug_register_callback(NULL, LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED | LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT, LIBUSB_HOTPLUG_ENUMERATE, VID_APPLE, LIBUSB_HOTPLUG_MATCH_ANY, 0, usb_hotplug_cb, NULL, &usb_hotplug_cb_handle);
 		if (res == LIBUSB_SUCCESS) {
@@ -1085,7 +1378,8 @@ void usb_shutdown(void)
 	usbmuxd_log(LL_DEBUG, "usb_shutdown");
 
 #ifdef HAVE_LIBUSB_HOTPLUG_API
-	libusb_hotplug_deregister_callback(NULL, usb_hotplug_cb_handle);
+	if (!event_thread_mode)
+		libusb_hotplug_deregister_callback(NULL, usb_hotplug_cb_handle);
 #endif
 
 	FOREACH(struct usb_device *usbdev, &device_list) {
@@ -1093,5 +1387,6 @@ void usb_shutdown(void)
 		usb_disconnect(usbdev);
 	} ENDFOREACH
 	collection_free(&device_list);
+	event_thread_stop();
 	libusb_exit(NULL);
 }
