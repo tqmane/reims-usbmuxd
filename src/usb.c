@@ -183,7 +183,7 @@ static int usb_submit_transfer(struct libusb_transfer *xfer)
 	return res;
 }
 
-static void dispatch_completed_transfers(void)
+static void dispatch_completed_transfers(libusb_device_handle *cancel_handle)
 {
 	char buf[64];
 
@@ -213,6 +213,10 @@ static void dispatch_completed_transfers(void)
 		xfer->flags = p->flags;
 		free(p);
 
+		// the device is being disconnected: make the callback clean up instead of resubmitting
+		if (cancel_handle && xfer->dev_handle == cancel_handle)
+			xfer->status = LIBUSB_TRANSFER_CANCELLED;
+
 		callback(xfer);
 		if (free_transfer)
 			libusb_free_transfer(xfer);
@@ -227,8 +231,46 @@ static int wait_completed_transfers(int msec)
 	pfd.revents = 0;
 	if (poll(&pfd, 1, msec) < 0 && errno != EINTR)
 		return -1;
-	dispatch_completed_transfers();
+	dispatch_completed_transfers(NULL);
 	return 0;
+}
+
+static void drain_device_transfers(libusb_device_handle *handle)
+{
+	while (1) {
+		struct libusb_transfer *to_cancel[16];
+		struct deferred_xfer *p;
+		int ncancel = 0;
+		int pending = 0;
+		int i;
+
+		mutex_lock(&deferred_mutex);
+		for (p = pending_xfers; p; p = p->next) {
+			if (p->xfer->dev_handle == handle) {
+				if (ncancel < (int)(sizeof(to_cancel) / sizeof(to_cancel[0])))
+					to_cancel[ncancel++] = p->xfer;
+				pending++;
+			}
+		}
+		mutex_unlock(&deferred_mutex);
+
+		// transfers are only freed on this thread, so they stay valid outside the lock
+		for (i = 0; i < ncancel; i++)
+			libusb_cancel_transfer(to_cancel[i]);
+
+		dispatch_completed_transfers(handle);
+		if (!pending)
+			break;
+
+		struct pollfd pfd;
+		pfd.fd = event_wakeup_pipe[0];
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+		if (poll(&pfd, 1, 1) < 0 && errno != EINTR) {
+			usbmuxd_log(LL_ERROR, "Waiting for transfers in usb_disconnect failed: %s", strerror(errno));
+			break;
+		}
+	}
 }
 
 static void *event_thread_func(void *data)
@@ -276,7 +318,18 @@ static void event_thread_stop(void)
 	thread_join(event_thread);
 	thread_free(event_thread);
 	event_thread = THREAD_T_NULL;
-	dispatch_completed_transfers();
+	// like without the event thread, callbacks of transfers left at shutdown are not run
+	while (completed_head) {
+		struct deferred_xfer *p = completed_head;
+		completed_head = p->next;
+		free(p);
+	}
+	completed_tail = NULL;
+	while (pending_xfers) {
+		struct deferred_xfer *p = pending_xfers;
+		pending_xfers = p->next;
+		free(p);
+	}
 	close(event_wakeup_pipe[0]);
 	close(event_wakeup_pipe[1]);
 	event_wakeup_pipe[0] = event_wakeup_pipe[1] = -1;
@@ -303,16 +356,16 @@ static void usb_disconnect(struct usb_device *dev)
 	} ENDFOREACH
 
 	// Busy-wait until all xfers are closed
+	if(event_thread_mode) {
+		drain_device_transfers(dev->handle);
+	}
 	while(collection_count(&dev->rx_xfers) || collection_count(&dev->tx_xfers)) {
 		struct timeval tv;
 		int res;
 
 		if(event_thread_mode) {
-			if(wait_completed_transfers(1) < 0) {
-				usbmuxd_log(LL_ERROR, "Waiting for transfers in usb_disconnect failed: %s", strerror(errno));
-				break;
-			}
-			continue;
+			usbmuxd_log(LL_ERROR, "usb_disconnect: transfers still queued after draining");
+			break;
 		}
 
 		tv.tv_sec = 0;
@@ -1178,7 +1231,7 @@ int usb_process(void)
 	int res;
 	struct timeval tv;
 	if(event_thread_mode) {
-		dispatch_completed_transfers();
+		dispatch_completed_transfers(NULL);
 	} else {
 		tv.tv_sec = tv.tv_usec = 0;
 		res = libusb_handle_events_timeout(NULL, &tv);
