@@ -1274,14 +1274,7 @@ int usb_init(void)
 		return -1;
 	}
 
-#if LIBUSB_API_VERSION >= 0x01000106
-	libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL, (log_level >= LL_DEBUG ? LIBUSB_LOG_LEVEL_DEBUG: (log_level >= LL_WARNING ? LIBUSB_LOG_LEVEL_WARNING: LIBUSB_LOG_LEVEL_NONE)));
-#else
-	libusb_set_debug(NULL, (log_level >= LL_DEBUG ? LIBUSB_LOG_LEVEL_DEBUG: (log_level >= LL_WARNING ? LIBUSB_LOG_LEVEL_WARNING: LIBUSB_LOG_LEVEL_NONE)));
-#endif
-
-	collection_init(&device_list);
-
+	// probe before raising libusb's log level, which would log the expected failure
 	const struct libusb_pollfd **usbfds = libusb_get_pollfds(NULL);
 	if (usbfds) {
 		libusb_free_pollfds(usbfds);
@@ -1292,6 +1285,14 @@ int usb_init(void)
 			return -1;
 		}
 	}
+
+#if LIBUSB_API_VERSION >= 0x01000106
+	libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL, (log_level >= LL_DEBUG ? LIBUSB_LOG_LEVEL_DEBUG: (log_level >= LL_WARNING ? LIBUSB_LOG_LEVEL_WARNING: LIBUSB_LOG_LEVEL_NONE)));
+#else
+	libusb_set_debug(NULL, (log_level >= LL_DEBUG ? LIBUSB_LOG_LEVEL_DEBUG: (log_level >= LL_WARNING ? LIBUSB_LOG_LEVEL_WARNING: LIBUSB_LOG_LEVEL_NONE)));
+#endif
+
+	collection_init(&device_list);
 
 #ifdef HAVE_LIBUSB_HOTPLUG_API
 	if (event_thread_mode) {
